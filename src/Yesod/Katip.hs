@@ -12,10 +12,13 @@
 {-# LANGUAGE UndecidableInstances #-}
 
 module Yesod.Katip
-  ( KatipSite (..)
+  ( KatipSite
+  , wrapK
   , insideK
 
-  , KatipContextSite (..)
+  , KatipContextSite
+  , wrapKC
+  , insideKC
 
   , LoggingApproach (..)
   ) where
@@ -41,7 +44,7 @@ import Yesod.Katip.Internal.Singletons
 katipLog :: LogEnv -> Loc -> LogSource -> LogLevel -> L.LogStr -> IO ()
 katipLog logEnv loc source level str = do
   runKatipT logEnv do
-    logItem () (sourceToNamespace source) (Just loc) (levelToSeverity level) (K.logStr $ L.fromLogStr str)
+    logItem () (Namespace []) (Just loc) (levelToSeverity level) (K.logStr $ L.fromLogStr str)
 
 katipLogWithContexts :: LogEnv -> LogContexts -> Namespace -> Loc -> LogSource -> LogLevel -> L.LogStr -> IO ()
 katipLogWithContexts logEnv logCtxts namespace loc source level str = do
@@ -54,9 +57,6 @@ levelToSeverity LevelInfo = InfoS
 levelToSeverity LevelWarn = WarningS
 levelToSeverity LevelError = ErrorS
 levelToSeverity (LevelOther other) = fromMaybe ErrorS $ textToSeverity other
-
-sourceToNamespace :: LogSource -> Namespace
-sourceToNamespace source = Namespace [source]
 
 ---------------
 --- LOGGING ---
