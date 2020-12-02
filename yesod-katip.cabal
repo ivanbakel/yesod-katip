@@ -17,6 +17,7 @@ library
   hs-source-dirs:      src
   exposed-modules:     Yesod.Katip
                      , Yesod.Katip.Orphans
+  other-modules:       Yesod.Katip.Internal.Singletons
   build-depends:       base >= 4.7 && < 5
                      , yesod-core >= 1.0 && < 2
                      , katip >= 0.8 && < 0.9
