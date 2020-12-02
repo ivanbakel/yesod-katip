@@ -11,12 +11,41 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 
+
+{-|
+Module      : Yesod.Katip
+Description : Wrappers for adding automatic Katip integration to Yesod sites.
+Copyright   : (c) Isaac van Bakel, 2020
+License     : BSD3
+Maintainer  : ivb@vanbakel.io
+Stability   : experimental
+Portability : POSIX
+
+Katip's structured logging is useful, but adding logging after-the-fact to a
+Yesod site which already uses the Yesod-provided logging invocations can be a
+lot of work.
+
+This module provides several convenience wrappers for converting existing Yesod
+sites into Katip-using versions without needing to modify any handlers.
+Instead, the wrapped versions will add in HTTP structures like requests, etc.
+automatically, and logs sent to Yesod will be intercepted and also sent to
+Katip along with any structure.
+
+These wrappers are configurable at the type level (for implementation reasons).
+They can be made to redirect logs, duplicate them (sending both to Katip and the
+Yesod logger), or even ignore them, as necessary. See 'LoggingApproach' for
+more detail.
+
+If your site has a 'Yesod' instance, so will the wrapped version - so using it
+is as simple as passing the wrapped version along to WAI, or whichever server
+you use.
+-}
 module Yesod.Katip
-  ( KatipSite
+  ( KatipSite (..)
   , wrapK
   , insideK
 
-  , KatipContextSite
+  , KatipContextSite (..)
   , wrapKC
   , insideKC
 
@@ -64,6 +93,12 @@ levelToSeverity (LevelOther other) = fromMaybe ErrorS $ textToSeverity other
 
 -- A Katip wrapper for logging to Katip from Yesod
 
+-- | A wrapper for adding Katip functionality to a site.
+--
+-- This is the most basic wrapper. It will allow you to redirect logs from
+-- Yesod to Katip, as configured by the @loggingApproach@ type argument.
+-- It will not include HTTP structures in the output - for that, look at
+-- 'KatipContextSite' instead.
 data KatipSite (loggingApproach :: LoggingApproach) site
   = KatipSite
       { unKatipSite :: site
@@ -235,6 +270,11 @@ instance (Yesod site, Eq (Route site), Has LogEnv site, SingLoggingApproach logg
 
 -- The same thing again, only this one logs the context
 
+-- | A wrapper for adding Katip functionality to a site.
+--
+-- This is the more featureful wrapper. It can redirect logs, just like
+-- 'KatipSite', but will also augment them with useful HTTP structure from
+-- Yesod.
 data KatipContextSite (loggingApproach :: LoggingApproach) site
   = KatipContextSite
       { unKatipContextSite :: site
@@ -389,6 +429,7 @@ instance (Yesod site, Eq (Route site), Has LogEnv site, Has LogContexts site, Ha
 
   shouldLogIO = shouldLogIO . unKatipContextSite
 
+  -- TODO: here, include the HTTP request etc in the context!
   yesodMiddleware = insideKC yesodMiddleware
 
   yesodWithInternalState (KatipContextSite site) mRoute = yesodWithInternalState site (unKCRoute <$> mRoute)

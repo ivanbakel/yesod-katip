@@ -1,6 +1,25 @@
 {-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE UndecidableInstances #-}
 
+{-|
+Module      : Yesod.Katip.Orphans
+Description : Orphan instances for Katip logging in Yesod handlers
+Copyright   : (c) Isaac van Bakel, 2020
+License     : BSD3
+Maintainer  : ivb@vanbakel.io
+Stability   : experimental
+Portability : POSIX
+
+This is an instance-only module, containing two useful orphan instances for
+the Yesod 'HandlerFor' monad: 'Katip', and 'KatipContext'.
+
+These instances allow you to use Katip logging functions inside Yesod
+handlers by including the necessary Katip state in your @site@ type. For
+example, by adding a Katip 'LogEnv' to your site, and defining the necessary
+@'Has' LogEnv site@ instance, you can then use any 'Katip' logging functions
+(like 'logMsg') directly in the handler.
+-}
+
 module Yesod.Katip.Orphans () where
 
 import Data.Has
