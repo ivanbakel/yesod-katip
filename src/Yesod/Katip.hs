@@ -1,16 +1,19 @@
+{-# OPTIONS_GHC -Wno-overlapping-patterns #-}
 {-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
-
 
 {-|
 Module      : Yesod.Katip
@@ -31,38 +34,98 @@ Instead, the wrapped versions will add in HTTP structures like requests, etc.
 automatically, and logs sent to Yesod will be intercepted and also sent to
 Katip along with any structure.
 
-These wrappers are configurable at the type level (for implementation reasons).
-They can be made to redirect logs, duplicate them (sending both to Katip and the
-Yesod logger), or even ignore them, as necessary. See 'LoggingApproach' for
-more detail.
+These wrappers are configurable - they can be made to redirect logs, duplicate
+them (sending both to Katip and the Yesod logger), or even ignore them, as
+necessary. See 'KatipConfig' for more detail.
 
 If your site has a 'Yesod' instance, so will the wrapped version - so using it
 is as simple as passing the wrapped version along to WAI, or whichever server
 you use.
+
+There's also support for using Katip's API for more direct control over your
+Katip logs inside Yesod handlers. This is based in 'SiteKatip', which is a
+ytl-style site class.
 -}
 module Yesod.Katip
   ( KatipSite (..)
-  , wrapK
-  , insideK
-
   , KatipContextSite (..)
-  , wrapKC
-  , insideKC
 
+  , KatipConfig (..)
   , LoggingApproach (..)
   ) where
 
-import Data.Has
-import Katip as K
-import Yesod.Core
-import Yesod.Core.Types
+import Yesod.Katip.Class
 
-import Control.Monad.Logger as L (Loc, LogSource, LogLevel, LogStr, fromLogStr)
-import Control.Monad.Reader
-import Data.Bifunctor (first)
+import qualified Katip as K
+import Network.Wai (Request)
+import Yesod.Core
+  ( RenderRoute (..)
+  , waiRequest
+  , Yesod (..)
+  )
+import Yesod.Core.Types
+import Yesod.Site.Class
+import Yesod.Site.Util
+import Yesod.Trans.Class as ST
+import Yesod.Trans.Class.Reader
+import Yesod.Trans.TH
+
+import Control.Monad (guard)
+import Control.Monad.Logger as L
+  ( Loc
+  , LogSource
+  , LogLevel (..)
+  , LogStr
+  , fromLogStr
+  )
+import Data.Bifunctor (second)
+import Data.Default
 import Data.Maybe (fromMaybe)
 
-import Yesod.Katip.Internal.Singletons
+-- | Control how the Katip wrapper directs logs that come from Yesod.
+--
+-- Regardless of the choice of approach, logs will only be sent when
+-- @shouldLogIO@ says they should.
+data LoggingApproach
+  = YesodOnly
+  -- ^ Send these logs only to the Yesod logger configured by the site's Yesod
+  -- instance already. This is provided only for debugging convenience - it
+  -- doesn't make sense to use it in production.
+  | KatipOnly
+  -- ^ Send these logs only to the Katip scribes, ignoring the Yesod
+  -- logger.
+  | Both
+  -- ^ Send logs to both the Katip scribes and the Yesod logger. If Katip is
+  -- configured to log structure as well, this structure *won't* be sent to the
+  -- Yesod logger. This is the default.
+
+-- | Configuration for how 'KatipSite' and 'KatipContextSite' turn Yesod logs
+-- into Katip ones
+data KatipConfig
+  = KatipConfig
+      { loggingApproach :: LoggingApproach
+      -- ^ How logs should be sent between the Yesod logger and your Katip scribes.
+      -- See 'LoggingApproach' for details.
+      , levelToSeverity :: LogLevel -> K.Severity
+      -- ^ How a Yesod level should be translated into a Katip severity.
+      , sourceToNamespace :: LogSource -> K.Namespace
+      -- ^ How a Yesod log source should modify the Katip namespace. By default,
+      -- it is appended on.
+      }
+
+instance Default KatipConfig where
+  def = KatipConfig
+          { loggingApproach = Both 
+          , levelToSeverity = defaultLevelToSeverity
+          , sourceToNamespace = K.Namespace . pure
+          }
+
+defaultLevelToSeverity :: LogLevel -> K.Severity
+defaultLevelToSeverity LevelDebug = K.DebugS
+defaultLevelToSeverity LevelInfo = K.InfoS
+defaultLevelToSeverity LevelWarn = K.WarningS
+defaultLevelToSeverity LevelError = K.ErrorS
+defaultLevelToSeverity (LevelOther other) = fromMaybe K.ErrorS $ K.textToSeverity other
 
 -------------------
 --- CONVERSIONS ---
@@ -70,22 +133,18 @@ import Yesod.Katip.Internal.Singletons
 
 -- Bridge between Yesod-style logging and Katip-style
 
-katipLog :: LogEnv -> Loc -> LogSource -> LogLevel -> L.LogStr -> IO ()
-katipLog logEnv loc source level str = do
-  runKatipT logEnv do
-    logItem () (Namespace []) (Just loc) (levelToSeverity level) (K.logStr $ L.fromLogStr str)
+katipLog :: KatipConfig -> K.LogEnv -> Loc -> LogSource -> LogLevel -> L.LogStr -> IO ()
+katipLog KatipConfig{..} logEnv loc source level str = do
+  K.runKatipT logEnv do
+    K.logItem () (sourceToNamespace source) (Just loc) (levelToSeverity level) (K.logStr $ L.fromLogStr str)
 
-katipLogWithContexts :: LogEnv -> LogContexts -> Namespace -> Loc -> LogSource -> LogLevel -> L.LogStr -> IO ()
-katipLogWithContexts logEnv logCtxts namespace loc source level str = do
-  runKatipContextT logEnv logCtxts namespace do
-    logItem logCtxts namespace (Just loc) (levelToSeverity level) (K.logStr $ L.fromLogStr str)
-
-levelToSeverity :: LogLevel -> Severity
-levelToSeverity LevelDebug = DebugS
-levelToSeverity LevelInfo = InfoS
-levelToSeverity LevelWarn = WarningS
-levelToSeverity LevelError = ErrorS
-levelToSeverity (LevelOther other) = fromMaybe ErrorS $ textToSeverity other
+katipLogWithContexts
+  :: KatipConfig -> K.LogEnv -> K.LogContexts -> K.Namespace
+  -> Loc -> LogSource -> LogLevel -> L.LogStr -> IO ()
+katipLogWithContexts KatipConfig{..} logEnv logCtxts namespace loc source level str = do
+  K.runKatipContextT logEnv logCtxts namespace do
+    K.logItem logCtxts (namespace <> sourceToNamespace source) (Just loc)
+      (levelToSeverity level) (K.logStr $ L.fromLogStr str)
 
 ---------------
 --- LOGGING ---
@@ -96,173 +155,51 @@ levelToSeverity (LevelOther other) = fromMaybe ErrorS $ textToSeverity other
 -- | A wrapper for adding Katip functionality to a site.
 --
 -- This is the most basic wrapper. It will allow you to redirect logs from
--- Yesod to Katip, as configured by the @loggingApproach@ type argument.
--- It will not include HTTP structures in the output - for that, look at
--- 'KatipContextSite' instead.
-data KatipSite (loggingApproach :: LoggingApproach) site
+-- Yesod to Katip, as configured.  It will not include HTTP structures in the
+-- output - for that, look at 'KatipContextSite' instead.
+newtype KatipSite site
   = KatipSite
-      { unKatipSite :: site
-      }
-  deriving Functor
-
--- Here is where the singletons become necessary - in order to run 'handler'
--- correctly, we actually need to *wrap* in a 'KatipSite' at this point -
--- but if the logging approach wasn't in the type, we would need to pick one
--- with no information to produce the wrapping.
-wrapKRHE :: RunHandlerEnv site site
-         -> RunHandlerEnv (KatipSite loggingApproach site) (KatipSite loggingApproach site)
-wrapKRHE RunHandlerEnv{..}
-  = RunHandlerEnv
-      { rheRender = rheRender . unKRoute
-      , rheRoute = KRoute <$> rheRoute
-      , rheRouteToMaster = KRoute . rheRouteToMaster . unKRoute
-      , rheSite = KatipSite rheSite
-      , rheChild = KatipSite rheSite
-      , ..
+      { unKatipSite :: ReaderSite (KatipConfig, K.LogEnv) site
       }
 
-unwrapKRHE :: RunHandlerEnv (KatipSite loggingApproach site) (KatipSite loggingApproach site)
-           -> RunHandlerEnv site site
-unwrapKRHE RunHandlerEnv{..}
-  = RunHandlerEnv
-      { rheRender = rheRender . KRoute
-      , rheRoute = unKRoute <$> rheRoute
-      , rheRouteToMaster = unKRoute . rheRouteToMaster . KRoute
-      , rheSite = unKatipSite rheSite
-      , rheChild = unKatipSite rheSite
-      , ..
-      }
+instance SiteTrans KatipSite where
+  lift = withSiteT unKatipSite . lift
 
-wrapK :: HandlerFor site a -> HandlerFor (KatipSite loggingApproach site) a
-wrapK (HandlerFor innerHandler) = HandlerFor \(HandlerData{..}) ->
-  innerHandler $ HandlerData
-    { handlerEnv = unwrapKRHE handlerEnv
-    , ..
-    }
+  mapSiteT runner = withSiteT unKatipSite . mapSiteT runner . withSiteT KatipSite
 
-unwrapK :: HandlerFor (KatipSite loggingApproach site) a
-        -> HandlerFor site a
-unwrapK (HandlerFor outerHandler) = HandlerFor \(HandlerData{..}) ->
-  outerHandler $ HandlerData
-    { handlerEnv = wrapKRHE handlerEnv
-    , ..
-    }
+instance (RenderRoute site, Eq (Route site)) => RenderRoute (KatipSite site) where
+  newtype Route (KatipSite site) = KRoute (Route (ReaderSite (KatipConfig, K.LogEnv) site))
+  renderRoute (KRoute route) = renderRoute route
 
-insideK :: (HandlerFor site a -> HandlerFor site b)
-        -> HandlerFor (KatipSite loggingApproach site) a
-        -> HandlerFor (KatipSite loggingApproach site) b
-insideK handler
-  = wrapK . handler . unwrapK
+instance SiteKatip (KatipSite site) where
+  getLogEnv = withSiteT unKatipSite $ snd <$> ask
 
-wrapKW :: WidgetFor site a -> WidgetFor (KatipSite loggingApproach site) a
-wrapKW (WidgetFor innerWidget)
-  -- TODO: figure out how best to do this. 'tellWidget' looks like the
-  -- right approach, but its semantics need checking
-  = error "This has not yet been implemented!"
+  localLogEnv f = withSiteT unKatipSite . (local $ second f) . withSiteT KatipSite
 
-unwrapKW :: WidgetFor (KatipSite loggingApproach site) a -> WidgetFor site a
-unwrapKW (WidgetFor outerWidget)
-  -- TODO: ditto
-  = error "This has not yet been implemented!"
+deriving instance Eq (Route site) => Eq (Route (KatipSite site))
 
-instance (Has a site) => (Has a (KatipSite loggingApproach site)) where
-  getter  = getter . unKatipSite
-  modifier mod = (modifier mod <$>)
-  hasLens f = (KatipSite <$>) . hasLens f . unKatipSite
+defaultYesodInstanceExcept [| unReaderSite . unKatipSite |] [d|
+    instance (SiteCompatible site (KatipSite site), Yesod site, Eq (Route site)) => Yesod (KatipSite site) where
+      messageLoggerSource (KatipSite (ReaderSite (config, env) site)) logger loc source level str = do
+        shouldLog <- shouldLogIO site source level
 
-instance (RenderRoute site, Eq (Route site)) => RenderRoute (KatipSite loggingApproach site) where
-  data Route (KatipSite loggingApproach site) = KRoute { unKRoute :: Route site }
-  renderRoute (KRoute route) = renderRoute @site route
+        let KatipConfig { loggingApproach } = config
+            logYesod = messageLoggerSource site logger loc source level str
+            logKatip = do
+              guard shouldLog
+              katipLog config env loc source level str
 
-deriving instance Eq (Route site) => Eq (Route (KatipSite loggingApproach site))
+        case loggingApproach of
+          KatipOnly ->
+            logKatip
 
-instance (Yesod site, Eq (Route site), Has LogEnv site, SingLoggingApproach loggingApproach)
-          => Yesod (KatipSite loggingApproach site) where
-  approot
-    = case approot @site of
-        ApprootRelative -> ApprootRelative
-        ApprootStatic root -> ApprootStatic root
-        ApprootMaster f -> ApprootMaster (f . unKatipSite)
-        ApprootRequest f -> ApprootRequest (f . unKatipSite)
-        -- Because new cases may be added without a major bump, we need a
-        -- fallback case for version compatibility
-        _ -> guessApproot
+          YesodOnly ->
+            logYesod
 
-  errorHandler err = wrapK (errorHandler err)
-
-  defaultLayout = wrapK . defaultLayout . unwrapKW
-
-  urlParamRenderOverride (KatipSite site) (KRoute route) query
-    = urlParamRenderOverride site route query
-
-  isAuthorized (KRoute route) = wrapK . isAuthorized route
-
-  isWriteRequest = wrapK . isWriteRequest . unKRoute
-
-  authRoute (KatipSite site)
-    = KRoute <$> authRoute site
-
-  cleanPath = cleanPath . unKatipSite
-
-  joinPath = joinPath . unKatipSite
-
-  addStaticContent ext mime content
-    = ((first KRoute <$>) <$>) <$> wrapK (addStaticContent ext mime content)
-
-  maximumContentLength (KatipSite site) mRoute
-    = maximumContentLength site (unKRoute <$> mRoute)
-
-  maximumContentLengthIO (KatipSite site) mRoute
-    = maximumContentLengthIO site (unKRoute <$> mRoute)
-
-  makeLogger = makeLogger . unKatipSite
-
-  messageLoggerSource (KatipSite site) logger loc source level str = do
-    shouldLog <- shouldLogIO site source level
-
-    let logYesod = messageLoggerSource site logger loc source level str
-        logKatip = do
-          guard shouldLog
-          katipLog (getter site) loc source level str
-        loggingApproach = fromSLoggingApproach (singLoggingApproach @loggingApproach)
-
-    case loggingApproach of
-      KatipOnly ->
-        logKatip
-
-      YesodOnly ->
-        logYesod
-
-      Both -> do
-        logKatip
-        logYesod
-
-  jsLoader (KatipSite site)
-    = case jsLoader site of
-        BottomOfBody -> BottomOfBody
-        BottomOfHeadBlocking -> BottomOfHeadBlocking
-        BottomOfHeadAsync asyncLoader ->
-          BottomOfHeadAsync \urls mAsyncWidget widgetToMake ->
-            let mInnerWidget = (\generator renderer -> generator (renderer . unKRoute)) <$> mAsyncWidget
-            in
-              asyncLoader urls mInnerWidget (widgetToMake . KRoute)
-
-  jsAttributes = jsAttributes . unKatipSite
-
-  jsAttributesHandler = wrapK jsAttributesHandler
-
-  makeSessionBackend = makeSessionBackend . unKatipSite
-
-  fileUpload = fileUpload . unKatipSite
-
-  shouldLogIO = shouldLogIO . unKatipSite
-
-  yesodMiddleware = insideK yesodMiddleware
-
-  yesodWithInternalState (KatipSite site) mRoute = yesodWithInternalState site (unKRoute <$> mRoute)
-
-  defaultMessageWidget snippet widget
-    = wrapKW (defaultMessageWidget snippet (\renderer -> widget (renderer . unKRoute)))
+          Both -> do
+            logKatip
+            logYesod
+  |]
 
 ----------------------------
 --- LOGGING WITH CONTEXT ---
@@ -275,164 +212,66 @@ instance (Yesod site, Eq (Route site), Has LogEnv site, SingLoggingApproach logg
 -- This is the more featureful wrapper. It can redirect logs, just like
 -- 'KatipSite', but will also augment them with useful HTTP structure from
 -- Yesod.
-data KatipContextSite (loggingApproach :: LoggingApproach) site
+data KatipContextSite site
   = KatipContextSite
-      { unKatipContextSite :: site
-      }
-  deriving Functor
-
-wrapKCRHE :: RunHandlerEnv site site
-         -> RunHandlerEnv (KatipContextSite loggingApproach site) (KatipContextSite loggingApproach site)
-wrapKCRHE RunHandlerEnv{..}
-  = RunHandlerEnv
-      { rheRender = rheRender . unKCRoute
-      , rheRoute = KCRoute <$> rheRoute
-      , rheRouteToMaster = KCRoute . rheRouteToMaster . unKCRoute
-      , rheSite = KatipContextSite rheSite
-      , rheChild = KatipContextSite rheSite
-      , ..
+      { unKatipContextSite :: ReaderSite (KatipConfig, K.LogEnv, K.LogContexts, K.Namespace) site
       }
 
-unwrapKCRHE :: RunHandlerEnv (KatipContextSite loggingApproach site) (KatipContextSite loggingApproach site)
-           -> RunHandlerEnv site site
-unwrapKCRHE RunHandlerEnv{..}
-  = RunHandlerEnv
-      { rheRender = rheRender . KCRoute
-      , rheRoute = unKCRoute <$> rheRoute
-      , rheRouteToMaster = unKCRoute . rheRouteToMaster . KCRoute
-      , rheSite = unKatipContextSite rheSite
-      , rheChild = unKatipContextSite rheSite
-      , ..
-      }
+instance SiteTrans KatipContextSite where
+  lift = withSiteT unKatipContextSite . lift
 
-wrapKC :: HandlerFor site a -> HandlerFor (KatipContextSite loggingApproach site) a
-wrapKC (HandlerFor innerHandler) = HandlerFor \(HandlerData{..}) ->
-  innerHandler $ HandlerData
-    { handlerEnv = unwrapKCRHE handlerEnv
-    , ..
-    }
+  mapSiteT runner = withSiteT unKatipContextSite . mapSiteT runner . withSiteT KatipContextSite
 
-unwrapKC :: HandlerFor (KatipContextSite loggingApproach site) a
-        -> HandlerFor site a
-unwrapKC (HandlerFor outerHandler) = HandlerFor \(HandlerData{..}) ->
-  outerHandler $ HandlerData
-    { handlerEnv = wrapKCRHE handlerEnv
-    , ..
-    }
+instance SiteKatip (KatipContextSite site) where
+  getLogEnv = withSiteT unKatipContextSite $ do
+    (_, env, _, _) <- ask
+    pure env
 
-insideKC :: (HandlerFor site a -> HandlerFor site b)
-        -> HandlerFor (KatipContextSite loggingApproach site) a
-        -> HandlerFor (KatipContextSite loggingApproach site) b
-insideKC handler
-  = wrapKC . handler . unwrapKC
+  localLogEnv f = withSiteT unKatipContextSite . local (\(a, env, c, d) -> (a, f env, c, d)) . withSiteT KatipContextSite
 
-wrapKCW :: WidgetFor site a -> WidgetFor (KatipContextSite loggingApproach site) a
-wrapKCW (WidgetFor innerWidget)
-  -- TODO: figure out how best to do this. 'tellWidget' looks like the
-  -- right approach, but its semantics need checking
-  = error "This has not yet been implemented!"
+instance SiteKatipContext (KatipContextSite site) where
+  getKatipContext = withSiteT unKatipContextSite $ do
+    (_, _, ctxt, _) <- ask
+    pure ctxt
 
-unwrapKCW :: WidgetFor (KatipContextSite loggingApproach site) a -> WidgetFor site a
-unwrapKCW (WidgetFor outerWidget)
-  -- TODO: ditto
-  = error "This has not yet been implemented!"
+  localKatipContext f = withSiteT unKatipContextSite . local (\(a, b, ctxt, d) -> (a, b, f ctxt, d)) . withSiteT KatipContextSite
 
-instance (Has a site) => (Has a (KatipContextSite loggingApproach site)) where
-  getter  = getter . unKatipContextSite
-  modifier mod = (modifier mod <$>)
-  hasLens f = (KatipContextSite <$>) . hasLens f . unKatipContextSite
+  getKatipNamespace = withSiteT unKatipContextSite $ do
+    (_, _, _, ns) <- ask
+    pure ns
+  localKatipNamespace f = withSiteT unKatipContextSite . local (\(a, b, c, ns) -> (a, b, c, f ns)) . withSiteT KatipContextSite
 
-instance (RenderRoute site, Eq (Route site)) => RenderRoute (KatipContextSite loggingApproach site) where
-  data Route (KatipContextSite loggingApproach site) = KCRoute { unKCRoute :: Route site }
-  renderRoute (KCRoute route) = renderRoute @site route
+instance (RenderRoute site, Eq (Route site)) => RenderRoute (KatipContextSite site) where
+  newtype Route (KatipContextSite site) = KCRoute (Route (ReaderSite (KatipConfig, K.LogEnv, K.LogContexts, K.Namespace) site))
+  renderRoute (KCRoute route) = renderRoute route
 
-deriving instance Eq (Route site) => Eq (Route (KatipContextSite loggingApproach site))
+deriving instance Eq (Route site) => Eq (Route (KatipContextSite site))
 
-instance (Yesod site, Eq (Route site), Has LogEnv site, Has LogContexts site, Has Namespace site, SingLoggingApproach loggingApproach)
-          => Yesod (KatipContextSite loggingApproach site) where
-  approot
-    = case approot @site of
-        ApprootRelative -> ApprootRelative
-        ApprootStatic root -> ApprootStatic root
-        ApprootMaster f -> ApprootMaster (f . unKatipContextSite)
-        ApprootRequest f -> ApprootRequest (f . unKatipContextSite)
-        -- Because new cases may be added without a major bump, we need a
-        -- fallback case for version compatibility
-        _ -> guessApproot
+defaultYesodInstanceExcept [| unReaderSite . unKatipContextSite |] [d|
+    instance (K.LogItem Request, SiteCompatible site (KatipContextSite site), Yesod site, Eq (Route site))
+      => Yesod (KatipContextSite site) where
+      messageLoggerSource (KatipContextSite (ReaderSite (config, env, context, namespace) site)) logger loc source level str = do
+        shouldLog <- shouldLogIO site source level
 
-  errorHandler err = wrapKC (errorHandler err)
+        let KatipConfig { loggingApproach } = config
+            logYesod = messageLoggerSource site logger loc source level str
+            logKatip = do
+              guard shouldLog
+              katipLogWithContexts config env context namespace loc source level str
 
-  defaultLayout = wrapKC . defaultLayout . unwrapKCW
+        case loggingApproach of
+          KatipOnly ->
+            logKatip
 
-  urlParamRenderOverride (KatipContextSite site) (KCRoute route) query
-    = urlParamRenderOverride site route query
+          YesodOnly ->
+            logYesod
 
-  isAuthorized (KCRoute route) = wrapKC . isAuthorized route
+          Both -> do
+            logKatip
+            logYesod
 
-  isWriteRequest = wrapKC . isWriteRequest . unKCRoute
+      yesodMiddleware argM = do
+        req <- waiRequest
+        K.katipAddContext req $ mapSiteT yesodMiddleware argM
+  |]
 
-  authRoute (KatipContextSite site)
-    = KCRoute <$> authRoute site
-
-  cleanPath = cleanPath . unKatipContextSite
-
-  joinPath = joinPath . unKatipContextSite
-
-  addStaticContent ext mime content
-    = ((first KCRoute <$>) <$>) <$> wrapKC (addStaticContent ext mime content)
-
-  maximumContentLength (KatipContextSite site) mRoute
-    = maximumContentLength site (unKCRoute <$> mRoute)
-
-  maximumContentLengthIO (KatipContextSite site) mRoute
-    = maximumContentLengthIO site (unKCRoute <$> mRoute)
-
-  makeLogger = makeLogger . unKatipContextSite
-
-  messageLoggerSource (KatipContextSite site) logger loc source level str = do
-    shouldLog <- shouldLogIO site source level
-
-    let logYesod = messageLoggerSource site logger loc source level str
-        logKatip = do
-          guard shouldLog
-          katipLogWithContexts (getter site) (getter site) (getter site) loc source level str
-        loggingApproach = fromSLoggingApproach (singLoggingApproach @loggingApproach)
-
-    case loggingApproach of
-      KatipOnly ->
-        logKatip
-
-      YesodOnly ->
-        logYesod
-
-      Both -> do
-        logKatip
-        logYesod
-
-  jsLoader (KatipContextSite site)
-    = case jsLoader site of
-        BottomOfBody -> BottomOfBody
-        BottomOfHeadBlocking -> BottomOfHeadBlocking
-        BottomOfHeadAsync asyncLoader ->
-          BottomOfHeadAsync \urls mAsyncWidget widgetToMake ->
-            let mInnerWidget = (\generator renderer -> generator (renderer . unKCRoute)) <$> mAsyncWidget
-            in
-              asyncLoader urls mInnerWidget (widgetToMake . KCRoute)
-
-  jsAttributes = jsAttributes . unKatipContextSite
-
-  jsAttributesHandler = wrapKC jsAttributesHandler
-
-  makeSessionBackend = makeSessionBackend . unKatipContextSite
-
-  fileUpload = fileUpload . unKatipContextSite
-
-  shouldLogIO = shouldLogIO . unKatipContextSite
-
-  -- TODO: here, include the HTTP request etc in the context!
-  yesodMiddleware = insideKC yesodMiddleware
-
-  yesodWithInternalState (KatipContextSite site) mRoute = yesodWithInternalState site (unKCRoute <$> mRoute)
-
-  defaultMessageWidget snippet widget
-    = wrapKCW (defaultMessageWidget snippet (\renderer -> widget (renderer . unKCRoute)))
